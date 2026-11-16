@@ -1,0 +1,150 @@
+name: 📡 Publish one.faf/* to the MCP Registry
+
+# The only place the faf.one DNS key lives. Each server repo runs its own
+# release checks, then hands off here with its repo name and release tag.
+#
+# Key:   environment `registry` secret FAF_ONE_MCP_PRIVATE_KEY (64-hex ed25519
+#        seed behind the `v=MCPv1; k=ed25519; p=...` TXT record at faf.one).
+#        The environment allows `main` only and needs a reviewer's approval.
+# Read:  repo secret READ_TOKEN (fine-grained, Contents: read) so private
+#        server repos (wjttc) can be checked out.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Server repo'
+        required: true
+        type: choice
+        options:
+          - Wolfe-Jam/faf-mcp
+          - Wolfe-Jam/claude-faf-mcp
+          - Wolfe-Jam/gemini-faf-mcp
+          - Wolfe-Jam/rust-faf-mcp
+          - Wolfe-Jam/grok-faf-mcp
+          - Wolfe-Jam/wjttc
+      tag:
+        description: 'Published release tag, e.g. v1.2.3'
+        required: true
+        type: string
+
+run-name: "Publish ${{ inputs.repo }} ${{ inputs.tag }}"
+
+concurrency:
+  group: publish-${{ inputs.repo }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  MCP_PUBLISHER_VERSION: v1.8.6
+  # sha256 of mcp-publisher_linux_amd64.tar.gz at v1.8.6 (registry_1.8.6_checksums.txt)
+  MCP_PUBLISHER_SHA256: 1fbe93fc0783c2394d8012c8d6e50a59e98cb2cc2d216264cc69f405d0e21340
+
+jobs:
+  check:
+    # No key here. Everything that can be refused is refused before the
+    # approval request is raised.
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.check.outputs.name }}
+      version: ${{ steps.check.outputs.version }}
+      already: ${{ steps.check.outputs.already }}
+    steps:
+      - name: Tag is a published (not draft) release of that repo
+        env:
+          GH_TOKEN: ${{ secrets.READ_TOKEN }}
+          REPO: ${{ inputs.repo }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -e
+          case "$TAG" in v[0-9]*) ;; *) echo "::error::tag '$TAG' is not of the form vX.Y.Z"; exit 1;; esac
+          DRAFT=$(gh api "repos/$REPO/releases/tags/$TAG" -q .draft) || { echo "::error::$REPO has no release for tag $TAG"; exit 1; }
+          [ "$DRAFT" = "false" ] || { echo "::error::$REPO release $TAG is a draft"; exit 1; }
+          echo "✓ $REPO $TAG is a published release"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repo }}
+          ref: refs/tags/${{ inputs.tag }}
+          token: ${{ secrets.READ_TOKEN }}
+          path: server
+          persist-credentials: false
+
+      - name: server.json is one.faf/<repo>, version == tag; already published?
+        id: check
+        working-directory: server
+        env:
+          REPO: ${{ inputs.repo }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -e
+          NAME=$(jq -r .name server.json)
+          VER=$(jq -r .version server.json)
+          WANT="one.faf/${REPO#*/}"
+          [ "$NAME" = "$WANT" ] || { echo "::error::server.json name '$NAME' is not '$WANT'"; exit 1; }
+          [ "$VER" = "${TAG#v}" ] || { echo "::error::server.json version $VER != tag $TAG"; exit 1; }
+          ENC=$(jq -rn --arg n "$NAME" '$n|@uri')
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://registry.modelcontextprotocol.io/v0.1/servers/${ENC}/versions/${VER}")
+          if [ "$CODE" = "200" ]; then ALREADY=true; else ALREADY=false; fi
+          { echo "name=$NAME"; echo "version=$VER"; echo "already=$ALREADY"; } >> "$GITHUB_OUTPUT"
+          echo "✓ $NAME $VER (already in registry: $ALREADY)"
+
+  publish:
+    needs: check
+    runs-on: ubuntu-latest
+    environment: registry
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: publisher
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repo }}
+          ref: refs/tags/${{ inputs.tag }}
+          token: ${{ secrets.READ_TOKEN }}
+          path: server
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+
+      - name: Install mcp-publisher (pinned, checksum verified)
+        run: |
+          set -e
+          curl -sSfL "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz" -o mcp-publisher.tar.gz
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar -xzf mcp-publisher.tar.gz mcp-publisher
+          chmod +x ./mcp-publisher
+          ./mcp-publisher --version
+
+      - name: Login via DNS (one.faf namespace)
+        env:
+          MCP_PRIVATE_KEY: ${{ secrets.FAF_ONE_MCP_PRIVATE_KEY }}
+        run: node publisher/.github/scripts/registry-login.mjs --domain faf.one
+
+      - name: Publish to MCP Registry
+        if: needs.check.outputs.already != 'true'
+        working-directory: server
+        run: ../mcp-publisher publish server.json
+
+      - name: Already published
+        if: needs.check.outputs.already == 'true'
+        run: echo "${{ needs.check.outputs.name }} ${{ needs.check.outputs.version }} is already in the registry. The login above proves the key; nothing was published."
+
+      - name: Round-trip verify
+        env:
+          NAME: ${{ needs.check.outputs.name }}
+          VER: ${{ needs.check.outputs.version }}
+        run: |
+          ENC=$(jq -rn --arg n "$NAME" '$n|@uri')
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://registry.modelcontextprotocol.io/v0.1/servers/${ENC}/versions/${VER}")
+            [ "$CODE" = "200" ] && { echo "✅ live: $NAME $VER"; exit 0; }
+            echo "⏳ HTTP $CODE ($i/5)"; sleep 8
+          done
+          echo "::warning::$NAME $VER not visible in the registry yet — verify manually"
